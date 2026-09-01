@@ -1,0 +1,83 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --font-sans: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+}
+
+body {
+  background-color: #E5E3DC;
+  color: #1C1B17;
+  font-family: var(--font-sans);
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* Warm Stone Native App Panel Styling */
+.warm-panel {
+  background-color: #EFECE5;
+  border: 1px solid #D6D2C8;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.03);
+}
+
+.warm-sidebar {
+  background-color: #DDD9D1;
+  border-right: 1px solid #D2CDC3;
+}
+
+.warm-card {
+  background-color: #EFECE5;
+  border: 1px solid #D6D2C8;
+  transition: all 0.15s ease-in-out;
+}
+
+.warm-card:hover {
+  background-color: #F5F3ED;
+  border-color: #C7C2B5;
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.04);
+}
+
+.warm-pill {
+  background-color: #E2DFD6;
+  border: 1px solid #D1CCC1;
+  color: #2D2C28;
+}
+
+.warm-pill-active {
+  background-color: #2563EB;
+  color: #FFFFFF;
+  border: 1px solid #1D4ED8;
+}
+
+.warm-input {
+  background-color: #E3E0D8;
+  border: 1px solid #CECAC0;
+  color: #1C1B17;
+}
+
+.warm-input:focus {
+  outline: none;
+  background-color: #FFFFFF;
+  border-color: #2563EB;
+  box-shadow: 0 0 0 3px rgba(37, 99, 235, 0.15);
+}
+
+/* Custom Scrollbars to match macOS warm theme */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #C8C3B8;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #A9A498;
+}

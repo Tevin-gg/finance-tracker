@@ -1,0 +1,21 @@
+# Live personal financial data — never version-controlled
+backend/finance.db
+finance_audit_export.json
+backend/agy.log
+backend/agy_coach.log
+
+# Python
+backend/.venv/
+backend/__pycache__/
+*.pyc
+
+# Node / Next.js
+frontend/node_modules/
+frontend/.next/
+frontend/next-env.d.ts
+
+# OS
+.DS_Store
+
+# Claude Code local tooling config (machine-specific, not app code)
+.claude/
