@@ -32,7 +32,8 @@ import {
   ShoppingBag,
   BarChart3,
   Archive,
-  ChevronLeft
+  ChevronLeft,
+  Briefcase
 } from "lucide-react";
 import { DailyCashFlowChart, CategoryBreakdownChart, DebtProgressChart, SavingsGoalsChart } from "./components/Charts";
 
@@ -102,6 +103,8 @@ interface TransactionItem {
   transaction_type: string;
   is_fixed: boolean;
   is_archived?: boolean;
+  account_id?: number | null;
+  to_account_id?: number | null;
 }
 
 interface ArchivedMonthSummary {
@@ -152,6 +155,23 @@ interface GearItem {
   kind: string; // "business" (Equipment Kit) vs "personal" (Personal Wishlist)
 }
 
+interface AccountItem {
+  id: number;
+  name: string;
+  type: string;
+  balance: number;
+  currency: string;
+  business_id?: number | null;
+}
+
+interface Business {
+  id: number;
+  name: string;
+  account_id: number;
+  balance: number;
+  created_at?: string;
+}
+
 interface AIAuditResult {
   score: number;
   audit_summary: string;
@@ -173,6 +193,17 @@ export default function Dashboard() {
   const [subscriptions, setSubscriptions] = useState<SubscriptionItem[]>([]);
   const [bankStatements, setBankStatements] = useState<BankStatementItem[]>([]);
   const [gearItems, setGearItems] = useState<GearItem[]>([]);
+  const [accounts, setAccounts] = useState<AccountItem[]>([]);
+  const [businesses, setBusinesses] = useState<Business[]>([]);
+  const [activeBusinessId, setActiveBusinessId] = useState<number | null>(null);
+
+  // Keep the selection in sync with what actually exists: default to the first
+  // business once any load, and drop back to null if the selected one gets deleted
+  // elsewhere. Without this, the ledger view (which already falls back to
+  // businesses[0] for display) and the header's "+ Add Entry" button visibility
+  // (which checks the raw state) could disagree about whether a business is
+  // "selected" — which is exactly what happened: the button hid itself while the
+  // ledger showed a business anyway.
   const [loading, setLoading] = useState(true);
   const [aiLoading, setAiLoading] = useState(false);
   const [aiAudit, setAiAudit] = useState<AIAuditResult | null>(null);
@@ -193,11 +224,11 @@ export default function Dashboard() {
   const [selectedHistoryMonth, setSelectedHistoryMonth] = useState<string | null>(null);
   const [historyTransactions, setHistoryTransactions] = useState<TransactionItem[]>([]);
 
-  const [activeCategory, setActiveCategory] = useState<"overview" | "cashflow" | "debt" | "subscriptions" | "bank" | "equipment" | "personal" | "insights" | "history">("overview");
+  const [activeCategory, setActiveCategory] = useState<"overview" | "cashflow" | "debt" | "subscriptions" | "bank" | "equipment" | "personal" | "insights" | "history" | "businesses">("overview");
   const [activeBankSubTab, setActiveBankSubTab] = useState<"sampath" | "subscription_acc">("sampath");
 
   const [showModal, setShowModal] = useState(false);
-  const [modalFormType, setModalFormType] = useState<"cashflow" | "debt" | "subscription" | "gear" | "bank" | "personal">("cashflow");
+  const [modalFormType, setModalFormType] = useState<"cashflow" | "debt" | "subscription" | "gear" | "bank" | "personal" | "business">("cashflow");
 
   const [fieldDesc, setFieldDesc] = useState("");
   const [fieldAmount, setFieldAmount] = useState("");
@@ -205,6 +236,41 @@ export default function Dashboard() {
   const [fieldType, setFieldType] = useState("expense");
   const [fieldPerson, setFieldPerson] = useState("");
   const [fieldDueDate, setFieldDueDate] = useState(new Date().toISOString().split("T")[0]);
+  // Which account an income/expense entry should hit. Left empty ("") means "let the
+  // backend guess" (cash if it covers the amount, else bank) — the old, confusing
+  // default. Picking one explicitly here is what actually fixes "cash expenses keep
+  // coming out of the bank": the guess only kicked in because tracked Cash On Hand
+  // was too low to 'afford' the expense, so it silently fell back to Sampath Bank.
+  const [fieldAccountId, setFieldAccountId] = useState<string>("");
+
+  // Shared modal for the four actions that used to move money via the same silent
+  // cash-if-it-covers-it-else-bank guess as the Add Entry form: paying a
+  // subscription, settling a debt, a partial debt payment, and adjusting gear
+  // savings. Each just needs an explicit account choice, some also an amount.
+  const [accountModal, setAccountModal] = useState<
+    | { type: "sub-pay"; sub: SubscriptionItem }
+    | { type: "debt-settle"; debt: DebtItem }
+    | { type: "debt-pay"; debt: DebtItem }
+    | { type: "gear-savings"; gear: GearItem }
+    | null
+  >(null);
+  const [actionAmount, setActionAmount] = useState("");
+  const [actionAccountId, setActionAccountId] = useState("");
+
+  // Replaces window.prompt()/window.confirm() everywhere in this file. Native dialogs
+  // are unreliable in real browsers — Chrome permanently silences alert/confirm/prompt
+  // on a page after the user (or an extension) dismisses one and checks "Prevent this
+  // page from creating additional dialogs," and some privacy extensions block them
+  // outright. When that happens the call just returns null/false instantly with no
+  // visible error, which looks exactly like "the button does nothing" — that's what
+  // broke the Add Business button. These two in-app modals never rely on the browser's
+  // own dialog system, so they can't be silenced that way.
+  const [promptModal, setPromptModal] = useState<
+    | { title: string; label: string; placeholder?: string; isNumber?: boolean; onSubmit: (value: string) => void }
+    | null
+  >(null);
+  const [promptValue, setPromptValue] = useState("");
+  const [confirmModal, setConfirmModal] = useState<{ message: string; onConfirm: () => void } | null>(null);
 
   const API_URL = "http://localhost:8002/api/v1";
 
@@ -214,15 +280,18 @@ export default function Dashboard() {
   // Escape closes whichever modal is open — neither modal had any keyboard dismiss
   // before, only the small X button.
   useEffect(() => {
-    if (!showModal && !showAiModal) return;
+    if (!showModal && !showAiModal && !accountModal && !promptModal && !confirmModal) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== "Escape") return;
       setShowModal(false);
       setShowAiModal(false);
+      setAccountModal(null);
+      setPromptModal(null);
+      setConfirmModal(null);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [showModal, showAiModal]);
+  }, [showModal, showAiModal, accountModal, promptModal, confirmModal]);
 
   useEffect(() => {
     if (!toast) return;
@@ -239,13 +308,15 @@ export default function Dashboard() {
     try {
       setLoading(true);
       setLoadError(null);
-      const [sumData, txData, debtData, subData, bankData, gearData] = await Promise.all([
+      const [sumData, txData, debtData, subData, bankData, gearData, accountData, businessData] = await Promise.all([
         apiFetch(`${API_URL}/summary`),
         apiFetch(`${API_URL}/transactions`),
         apiFetch(`${API_URL}/debts`),
         apiFetch(`${API_URL}/subscriptions`),
         apiFetch(`${API_URL}/bank-statements`),
         apiFetch(`${API_URL}/gear`),
+        apiFetch(`${API_URL}/accounts`),
+        apiFetch(`${API_URL}/businesses`),
       ]);
 
       setSummary(sumData);
@@ -254,6 +325,8 @@ export default function Dashboard() {
       setSubscriptions(subData);
       setBankStatements(bankData);
       setGearItems(gearData);
+      setAccounts(accountData);
+      setBusinesses(businessData);
     } catch (err) {
       console.error("Failed to fetch data:", err);
       setLoadError(err instanceof Error ? err.message : "Failed to reach the backend.");
@@ -265,6 +338,16 @@ export default function Dashboard() {
   useEffect(() => {
     fetchData();
   }, []);
+
+  useEffect(() => {
+    if (businesses.length === 0) {
+      if (activeBusinessId !== null) setActiveBusinessId(null);
+      return;
+    }
+    if (!businesses.some((b) => b.id === activeBusinessId)) {
+      setActiveBusinessId(businesses[0].id);
+    }
+  }, [businesses, activeBusinessId]);
 
   const fetchHistoryMonths = async () => {
     try {
@@ -311,6 +394,9 @@ export default function Dashboard() {
     } else if (activeCategory === "bank") {
       setModalFormType("bank");
       setFieldType("deposit");
+    } else if (activeCategory === "businesses") {
+      setModalFormType("business");
+      setFieldType("expense");
     } else {
       setModalFormType("cashflow");
       setFieldType("expense");
@@ -319,7 +405,32 @@ export default function Dashboard() {
     setFieldDesc("");
     setFieldAmount("");
     setFieldPerson("");
+    setFieldAccountId("");
     setShowModal(true);
+  };
+
+  const handleAddBusiness = () => {
+    setPromptValue("");
+    setPromptModal({
+      title: "Add Business",
+      label: "Business name",
+      placeholder: "e.g. Photography, Trading",
+      onSubmit: async (name) => {
+        if (!name.trim()) return;
+        try {
+          const biz = await apiFetch(`${API_URL}/businesses`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name: name.trim() }),
+          });
+          setToast({ message: "Business added.", type: "success" });
+          setActiveBusinessId(biz.id);
+          fetchData();
+        } catch (err) {
+          showError("Couldn't add that business.", err);
+        }
+      },
+    });
   };
 
   const handleRunAiAudit = async () => {
@@ -378,40 +489,50 @@ export default function Dashboard() {
     }
   };
 
-  const handleEditBankBalance = async () => {
-    const newBalStr = prompt("Enter new Sampath Bank balance (Rs):", summary ? summary.bank_balance.toString() : "0");
-    if (newBalStr === null) return;
-    const num = parseFloat(newBalStr);
-    if (isNaN(num)) return;
-
-    try {
-      await apiFetch(`${API_URL}/accounts/bank-balance`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ balance: num }),
-      });
-      fetchData();
-    } catch (err) {
-      showError("Failed to update the bank balance.", err);
-    }
+  const handleEditBankBalance = () => {
+    setPromptValue(summary ? summary.bank_balance.toString() : "0");
+    setPromptModal({
+      title: "Edit Bank Balance",
+      label: "New Sampath Bank balance (Rs)",
+      isNumber: true,
+      onSubmit: async (newBalStr) => {
+        const num = parseFloat(newBalStr);
+        if (isNaN(num)) return;
+        try {
+          await apiFetch(`${API_URL}/accounts/bank-balance`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ balance: num }),
+          });
+          fetchData();
+        } catch (err) {
+          showError("Failed to update the bank balance.", err);
+        }
+      },
+    });
   };
 
-  const handleEditCashBalance = async () => {
-    const newBalStr = prompt("Enter physical Cash On Hand in wallet (Rs):", summary ? (summary.cash_on_hand || 0).toString() : "0");
-    if (newBalStr === null) return;
-    const num = parseFloat(newBalStr);
-    if (isNaN(num)) return;
-
-    try {
-      await apiFetch(`${API_URL}/accounts/cash-balance`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ balance: num }),
-      });
-      fetchData();
-    } catch (err) {
-      showError("Failed to update Cash On Hand.", err);
-    }
+  const handleEditCashBalance = () => {
+    setPromptValue(summary ? (summary.cash_on_hand || 0).toString() : "0");
+    setPromptModal({
+      title: "Edit Cash On Hand",
+      label: "Physical Cash On Hand in wallet (Rs)",
+      isNumber: true,
+      onSubmit: async (newBalStr) => {
+        const num = parseFloat(newBalStr);
+        if (isNaN(num)) return;
+        try {
+          await apiFetch(`${API_URL}/accounts/cash-balance`, {
+            method: "PATCH",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ balance: num }),
+          });
+          fetchData();
+        } catch (err) {
+          showError("Failed to update Cash On Hand.", err);
+        }
+      },
+    });
   };
 
   const handleFormSubmit = async (e: React.FormEvent) => {
@@ -421,6 +542,12 @@ export default function Dashboard() {
 
     try {
       if (modalFormType === "cashflow") {
+        // "transfer_deposit"/"transfer_withdraw" are a frontend-only split of the one
+        // backend transaction_type "transfer" — Transfer is now a real from-account ->
+        // to-account move (any pair), not hardcoded Cash -> Bank only, so a plain
+        // "transfer" dropdown value can't say which direction on its own anymore.
+        const isDeposit = fieldType === "transfer_deposit";
+        const isWithdraw = fieldType === "transfer_withdraw";
         await apiFetch(`${API_URL}/transactions`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
@@ -429,8 +556,37 @@ export default function Dashboard() {
             description: fieldDesc,
             amount: amount,
             category: fieldCategory,
-            transaction_type: fieldType, // "expense", "income", or "transfer"
+            transaction_type: (isDeposit || isWithdraw) ? "transfer" : fieldType, // "expense", "income", or "transfer"
             is_fixed: false,
+            // Explicit choice for income/expense — this is what stops the backend
+            // from guessing cash-if-it-covers-it-else-bank. For a transfer, these two
+            // ARE the whole point: which account it left from and landed in.
+            account_id: isDeposit ? cashAccount?.id : isWithdraw ? bankAccount?.id : (fieldAccountId ? Number(fieldAccountId) : undefined),
+            to_account_id: isDeposit ? bankAccount?.id : isWithdraw ? cashAccount?.id : undefined,
+          }),
+        });
+      } else if (modalFormType === "business") {
+        const business = businesses.find((b) => b.id === activeBusinessId);
+        if (!business) return;
+        const isDraw = fieldType === "draw";       // business -> personal (Owner's Draw)
+        const isInject = fieldType === "inject";   // personal -> business (Capital Injection)
+        const otherAccountId = fieldAccountId ? Number(fieldAccountId) : undefined;
+        await apiFetch(`${API_URL}/transactions`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            date: new Date().toISOString().split("T")[0],
+            description: fieldDesc,
+            amount: amount,
+            category: fieldCategory,
+            transaction_type: (isDraw || isInject) ? "transfer" : fieldType, // "expense", "income", "draw", or "inject"
+            is_fixed: false,
+            // Income/expense always hit this business's own account — no guessing
+            // possible since a business has exactly one account. Draw/Inject move
+            // between this business's account and whichever personal account was
+            // picked (Cash On Hand or Sampath Bank).
+            account_id: isDraw ? business.account_id : isInject ? otherAccountId : business.account_id,
+            to_account_id: isDraw ? otherAccountId : isInject ? business.account_id : undefined,
           }),
         });
       } else if (modalFormType === "debt") {
@@ -506,109 +662,142 @@ export default function Dashboard() {
     }
   };
 
-  const handleDeleteTransaction = async (id: number) => {
-    if (!confirm("Are you sure you want to remove this transaction entry?")) return;
-    try {
-      await apiFetch(`${API_URL}/transactions/${id}`, { method: "DELETE" });
-      fetchData();
-    } catch (err) {
-      showError("Failed to delete that transaction.", err);
-    }
+  const handleDeleteTransaction = (id: number) => {
+    setConfirmModal({
+      message: "Are you sure you want to remove this transaction entry?",
+      onConfirm: async () => {
+        try {
+          await apiFetch(`${API_URL}/transactions/${id}`, { method: "DELETE" });
+          fetchData();
+        } catch (err) {
+          showError("Failed to delete that transaction.", err);
+        }
+      },
+    });
   };
 
-  const handleDeleteDebt = async (id: number) => {
-    if (!confirm("Are you sure you want to remove this debt entry?")) return;
-    try {
-      await apiFetch(`${API_URL}/debts/${id}`, { method: "DELETE" });
-      fetchData();
-    } catch (err) {
-      showError("Failed to delete that debt.", err);
-    }
+  const handleDeleteDebt = (id: number) => {
+    setConfirmModal({
+      message: "Are you sure you want to remove this debt entry?",
+      onConfirm: async () => {
+        try {
+          await apiFetch(`${API_URL}/debts/${id}`, { method: "DELETE" });
+          fetchData();
+        } catch (err) {
+          showError("Failed to delete that debt.", err);
+        }
+      },
+    });
   };
 
-  const handleDeleteSubscription = async (id: number) => {
-    if (!confirm("Are you sure you want to remove this subscription?")) return;
-    try {
-      await apiFetch(`${API_URL}/subscriptions/${id}`, { method: "DELETE" });
-      fetchData();
-    } catch (err) {
-      showError("Failed to delete that subscription.", err);
-    }
+  const handleDeleteSubscription = (id: number) => {
+    setConfirmModal({
+      message: "Are you sure you want to remove this subscription?",
+      onConfirm: async () => {
+        try {
+          await apiFetch(`${API_URL}/subscriptions/${id}`, { method: "DELETE" });
+          fetchData();
+        } catch (err) {
+          showError("Failed to delete that subscription.", err);
+        }
+      },
+    });
   };
 
-  const handleDeleteBankItem = async (id: number) => {
-    if (!confirm("Are you sure you want to remove this bank statement entry?")) return;
-    try {
-      await apiFetch(`${API_URL}/bank-statements/${id}`, { method: "DELETE" });
-      fetchData();
-    } catch (err) {
-      showError("Failed to delete that bank statement entry.", err);
-    }
+  const handleDeleteBankItem = (id: number) => {
+    setConfirmModal({
+      message: "Are you sure you want to remove this bank statement entry?",
+      onConfirm: async () => {
+        try {
+          await apiFetch(`${API_URL}/bank-statements/${id}`, { method: "DELETE" });
+          fetchData();
+        } catch (err) {
+          showError("Failed to delete that bank statement entry.", err);
+        }
+      },
+    });
   };
 
-  const handleDeleteGearItem = async (id: number) => {
-    if (!confirm("Are you sure you want to remove this equipment item?")) return;
-    try {
-      await apiFetch(`${API_URL}/gear/${id}`, { method: "DELETE" });
-      fetchData();
-    } catch (err) {
-      showError("Failed to delete that item.", err);
-    }
+  const handleDeleteGearItem = (id: number) => {
+    setConfirmModal({
+      message: "Are you sure you want to remove this equipment item?",
+      onConfirm: async () => {
+        try {
+          await apiFetch(`${API_URL}/gear/${id}`, { method: "DELETE" });
+          fetchData();
+        } catch (err) {
+          showError("Failed to delete that item.", err);
+        }
+      },
+    });
   };
 
-  const handlePaySubscription = async (subId: number) => {
-    try {
-      await apiFetch(`${API_URL}/subscriptions/${subId}/pay`, { method: "PATCH" });
-      fetchData();
-    } catch (err) {
-      showError("Failed to mark that subscription paid.", err);
-    }
+  // These four actions all used to move money by guessing an account (cash if it
+  // covers the amount, else bank) with no way to override it — same bug class as
+  // the main Add Entry form had. They now open a shared modal with an explicit
+  // account picker instead of firing straight off a button click / prompt().
+  const openPaySubscriptionModal = (sub: SubscriptionItem) => {
+    setActionAccountId("");
+    setAccountModal({ type: "sub-pay", sub });
   };
 
-  const handleSettleDebt = async (debtId: number) => {
-    try {
-      await apiFetch(`${API_URL}/debts/${debtId}/settle`, { method: "PATCH" });
-      fetchData();
-    } catch (err) {
-      showError("Failed to settle that debt.", err);
-    }
+  const openSettleDebtModal = (debt: DebtItem) => {
+    setActionAccountId("");
+    setAccountModal({ type: "debt-settle", debt });
   };
 
-  const handlePartialPayDebt = async (debt: DebtItem) => {
-    const remaining = debt.remaining_amount ?? (debt.amount - debt.paid_amount);
-    const label = debt.type === "i_owe" ? "repayment" : "collection";
-    const amountStr = prompt(`Enter partial ${label} amount for ${debt.person} (Remaining: Rs ${remaining.toLocaleString()}):`);
-    if (amountStr === null) return;
-    const num = parseFloat(amountStr);
-    if (isNaN(num) || num <= 0) return;
-
-    try {
-      await apiFetch(`${API_URL}/debts/${debt.id}/pay`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ payment_amount: num }),
-      });
-      fetchData();
-    } catch (err) {
-      showError("That payment couldn't be recorded.", err);
-    }
+  const openPartialPayDebtModal = (debt: DebtItem) => {
+    setActionAmount("");
+    setActionAccountId("");
+    setAccountModal({ type: "debt-pay", debt });
   };
 
-  const handleUpdateSavings = async (gearId: number, currentSaved: number, cost: number) => {
-    const newSavings = prompt(`Enter new saved amount (Cost: Rs ${cost.toLocaleString()}):`, currentSaved.toString());
-    if (newSavings === null) return;
-    const num = parseFloat(newSavings);
-    if (isNaN(num)) return;
+  const openUpdateSavingsModal = (gear: GearItem) => {
+    setActionAmount(gear.saved_amount.toString());
+    setActionAccountId("");
+    setAccountModal({ type: "gear-savings", gear });
+  };
+
+  const handleAccountModalSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!accountModal) return;
+    const accountId = actionAccountId ? Number(actionAccountId) : undefined;
 
     try {
-      await apiFetch(`${API_URL}/gear/${gearId}`, {
-        method: "PATCH",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ saved_amount: num }),
-      });
+      if (accountModal.type === "sub-pay") {
+        await apiFetch(`${API_URL}/subscriptions/${accountModal.sub.id}/pay`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ account_id: accountId }),
+        });
+      } else if (accountModal.type === "debt-settle") {
+        await apiFetch(`${API_URL}/debts/${accountModal.debt.id}/settle`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ account_id: accountId }),
+        });
+      } else if (accountModal.type === "debt-pay") {
+        const num = parseFloat(actionAmount);
+        if (isNaN(num) || num <= 0) return;
+        await apiFetch(`${API_URL}/debts/${accountModal.debt.id}/pay`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ payment_amount: num, account_id: accountId }),
+        });
+      } else if (accountModal.type === "gear-savings") {
+        const num = parseFloat(actionAmount);
+        if (isNaN(num)) return;
+        await apiFetch(`${API_URL}/gear/${accountModal.gear.id}`, {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ saved_amount: num, account_id: accountId }),
+        });
+      }
+      setAccountModal(null);
+      setToast({ message: "Saved.", type: "success" });
       fetchData();
     } catch (err) {
-      showError("Failed to update savings.", err);
+      showError("That couldn't be saved.", err);
     }
   };
 
@@ -645,6 +834,9 @@ export default function Dashboard() {
       </div>
     );
   }
+
+  const cashAccount = accounts.find((a) => a.name === "Cash On Hand");
+  const bankAccount = accounts.find((a) => a.name === "Sampath Bank");
 
   // Once a month is closed (see the History tab), its transactions are archived —
   // they stay in the database for History and for the Charts tab's real trailing
@@ -791,6 +983,16 @@ export default function Dashboard() {
               <Archive className="w-4 h-4" />
               <span className="truncate">8. History</span>
             </button>
+
+            <button
+              onClick={() => setActiveCategory("businesses")}
+              className={`w-full flex items-center space-x-2.5 px-3 py-2 rounded-xl text-left font-medium transition ${
+                activeCategory === "businesses" ? "bg-[#18181B] text-white shadow-sm font-semibold" : "text-[#2C2B27] hover:bg-[#D5D1C7]"
+              }`}
+            >
+              <Briefcase className="w-4 h-4" />
+              <span className="truncate">9. Businesses</span>
+            </button>
           </div>
 
           <div className="space-y-1 text-xs pt-3 border-t border-[#D2CDC3]">
@@ -842,11 +1044,22 @@ export default function Dashboard() {
               {activeCategory === "personal" && "6. Personal Wishlist"}
               {activeCategory === "insights" && "7. Charts & Insights"}
               {activeCategory === "history" && "8. History"}
+              {activeCategory === "businesses" && "9. Businesses"}
             </h2>
           </div>
 
           <div className="flex items-center space-x-2">
-            {activeCategory !== "insights" && activeCategory !== "history" && (
+            {activeCategory === "businesses" && (
+              <button
+                onClick={handleAddBusiness}
+                className="flex items-center space-x-1.5 px-3.5 py-1.5 bg-[#EFECE5] hover:bg-[#F6F4EE] text-[#1C1B17] border border-[#D6D2C8] rounded-xl text-xs font-semibold transition shadow-sm"
+              >
+                <Plus className="w-4 h-4 text-[#7C3AED]" />
+                <span>+ Add Business</span>
+              </button>
+            )}
+
+            {activeCategory !== "insights" && activeCategory !== "history" && !(activeCategory === "businesses" && !activeBusinessId) && (
               <button
                 onClick={openAddModal}
                 className="flex items-center space-x-1.5 px-3.5 py-1.5 bg-[#EFECE5] hover:bg-[#F6F4EE] text-[#1C1B17] border border-[#D6D2C8] rounded-xl text-xs font-semibold transition shadow-sm"
@@ -858,7 +1071,8 @@ export default function Dashboard() {
                   {activeCategory === "equipment" && "+ Add Equipment"}
                   {activeCategory === "personal" && "+ Add Personal Item"}
                   {activeCategory === "bank" && "+ Add Bank Entry"}
-                  {activeCategory !== "debt" && activeCategory !== "subscriptions" && activeCategory !== "equipment" && activeCategory !== "personal" && activeCategory !== "bank" && "+ Add Entry"}
+                  {activeCategory === "businesses" && "+ Add Entry"}
+                  {activeCategory !== "debt" && activeCategory !== "subscriptions" && activeCategory !== "equipment" && activeCategory !== "personal" && activeCategory !== "bank" && activeCategory !== "businesses" && "+ Add Entry"}
                 </span>
               </button>
             )}
@@ -1196,13 +1410,13 @@ export default function Dashboard() {
                             {!debt.is_settled && (
                               <>
                                 <button
-                                  onClick={() => handlePartialPayDebt(debt)}
+                                  onClick={() => openPartialPayDebtModal(debt)}
                                   className="px-2 py-1 bg-[#18181B] text-white rounded text-[10px] font-semibold hover:bg-[#27272A]"
                                 >
                                   + Pay
                                 </button>
                                 <button
-                                  onClick={() => handleSettleDebt(debt.id)}
+                                  onClick={() => openSettleDebtModal(debt)}
                                   className="px-2 py-1 bg-[#16A34A] text-white rounded text-[10px] font-semibold hover:bg-[#15803D]"
                                 >
                                   Full Settle
@@ -1266,13 +1480,13 @@ export default function Dashboard() {
                             {!debt.is_settled && (
                               <>
                                 <button
-                                  onClick={() => handlePartialPayDebt(debt)}
+                                  onClick={() => openPartialPayDebtModal(debt)}
                                   className="px-2 py-1 bg-[#18181B] text-white rounded text-[10px] font-semibold hover:bg-[#27272A]"
                                 >
                                   + Collect
                                 </button>
                                 <button
-                                  onClick={() => handleSettleDebt(debt.id)}
+                                  onClick={() => openSettleDebtModal(debt)}
                                   className="px-2 py-1 bg-[#16A34A] text-white rounded text-[10px] font-semibold hover:bg-[#15803D]"
                                 >
                                   Full Settle
@@ -1334,7 +1548,7 @@ export default function Dashboard() {
                         <td className="py-3 px-3 text-center space-x-2">
                           {!sub.is_paid_this_month ? (
                             <button
-                              onClick={() => handlePaySubscription(sub.id)}
+                              onClick={() => openPaySubscriptionModal(sub)}
                               className="px-3 py-1 bg-[#18181B] text-white rounded text-[10px] font-semibold hover:bg-[#27272A] transition"
                             >
                               Mark Paid
@@ -1491,7 +1705,7 @@ export default function Dashboard() {
                             </td>
                             <td className="py-2.5 px-3 text-center space-x-2">
                               <button
-                                onClick={() => handleUpdateSavings(item.id, item.saved_amount, item.cost)}
+                                onClick={() => openUpdateSavingsModal(item)}
                                 className="px-2 py-1 bg-[#18181B] text-white rounded text-[10px] font-semibold hover:bg-[#27272A]"
                               >
                                 + Savings
@@ -1604,7 +1818,7 @@ export default function Dashboard() {
                             </td>
                             <td className="py-2.5 px-3 text-center space-x-2">
                               <button
-                                onClick={() => handleUpdateSavings(item.id, item.saved_amount, item.cost)}
+                                onClick={() => openUpdateSavingsModal(item)}
                                 className="px-2 py-1 bg-[#18181B] text-white rounded text-[10px] font-semibold hover:bg-[#27272A]"
                               >
                                 + Savings
@@ -1785,6 +1999,124 @@ export default function Dashboard() {
             </div>
           )}
 
+          {/* VIEW 9: BUSINESSES */}
+          {activeCategory === "businesses" && (
+            <div className="space-y-4">
+              {businesses.length === 0 ? (
+                <div className="warm-card p-8 rounded-2xl text-center space-y-2">
+                  <Briefcase className="w-8 h-8 text-[#8E8A80] mx-auto" />
+                  <p className="text-sm font-bold text-[#1C1B17]">No businesses yet</p>
+                  <p className="text-xs text-[#8E8A80]">Click "+ Add Business" above to set up your first one — each gets its own balance, completely separate from your personal accounts.</p>
+                </div>
+              ) : (() => {
+                const business = businesses.find((b) => b.id === activeBusinessId) || businesses[0];
+                const businessTx = currentTransactions.filter(
+                  (t) => t.account_id === business.account_id || t.to_account_id === business.account_id
+                );
+                return (
+                  <>
+                    {/* Business Switcher Sub-Tabs */}
+                    <div className="flex flex-wrap gap-2 border-b border-[#D6D2C8] pb-2 text-xs">
+                      {businesses.map((b) => (
+                        <button
+                          key={b.id}
+                          onClick={() => setActiveBusinessId(b.id)}
+                          className={`px-3 py-1.5 rounded-xl font-bold transition ${
+                            business.id === b.id ? "bg-[#18181B] text-white" : "bg-[#EFECE5] text-[#6B6860] hover:bg-[#F6F4EE]"
+                          }`}
+                        >
+                          {b.name} (Rs {b.balance.toLocaleString()})
+                        </button>
+                      ))}
+                    </div>
+
+                    <div className="warm-card p-5 rounded-2xl space-y-4">
+                      <div className="flex justify-between items-center border-b border-[#D6D2C8] pb-3">
+                        <h3 className="text-sm font-bold text-[#1C1B17] flex items-center space-x-2">
+                          <Briefcase className="w-4 h-4 text-[#7C3AED]" />
+                          <span>{business.name} Ledger</span>
+                        </h3>
+                        <div className="flex items-center space-x-2">
+                          <button
+                            onClick={() => {
+                              setPromptValue(business.name);
+                              setPromptModal({
+                                title: "Rename Business",
+                                label: "Business name",
+                                onSubmit: async (name) => {
+                                  if (!name.trim() || name.trim() === business.name) return;
+                                  try {
+                                    await apiFetch(`${API_URL}/businesses/${business.id}`, {
+                                      method: "PATCH",
+                                      headers: { "Content-Type": "application/json" },
+                                      body: JSON.stringify({ name: name.trim() }),
+                                    });
+                                    fetchData();
+                                  } catch (err) {
+                                    showError("Couldn't rename that business.", err);
+                                  }
+                                },
+                              });
+                            }}
+                            className="text-[#8E8A80] hover:text-[#1C1B17]"
+                            title="Rename business"
+                          >
+                            <Edit3 className="w-3.5 h-3.5" />
+                          </button>
+                          <span className="text-xs font-mono font-bold text-[#7C3AED]">
+                            Balance: Rs {business.balance.toLocaleString()}
+                          </span>
+                        </div>
+                      </div>
+
+                      {businessTx.length === 0 ? (
+                        <p className="text-xs text-[#8E8A80] py-8 text-center">No entries yet for {business.name}. Use "+ Add Entry" above.</p>
+                      ) : (
+                        <div className="overflow-x-auto">
+                          <table className="w-full text-left text-xs border-collapse">
+                            <thead>
+                              <tr className="text-[#6B6860] border-b border-[#D6D2C8] font-semibold">
+                                <th className="py-2 px-3">Date</th>
+                                <th className="py-2 px-3">Description</th>
+                                <th className="py-2 px-3">Type</th>
+                                <th className="py-2 px-3 text-right">Amount (Rs)</th>
+                                <th className="py-2 px-3 text-center">Action</th>
+                              </tr>
+                            </thead>
+                            <tbody className="divide-y divide-[#E2DFD6]">
+                              {businessTx.map((tx) => {
+                                const isDrawOut = tx.transaction_type === "transfer" && tx.account_id === business.account_id;
+                                const label = tx.transaction_type === "income" ? "Income"
+                                  : tx.transaction_type === "expense" ? "Expense"
+                                  : isDrawOut ? "Owner's Draw" : "Capital Injection";
+                                const isOutflow = tx.transaction_type === "expense" || isDrawOut;
+                                return (
+                                  <tr key={tx.id} className="hover:bg-[#F6F4EE]">
+                                    <td className="py-2.5 px-3 text-[#6B6860]">{tx.date}</td>
+                                    <td className="py-2.5 px-3 font-semibold text-[#1C1B17]">{tx.description}</td>
+                                    <td className="py-2.5 px-3 text-[#6B6860]">{label}</td>
+                                    <td className={`py-2.5 px-3 text-right font-mono font-bold ${isOutflow ? "text-[#DC2626]" : "text-[#16A34A]"}`}>
+                                      {isOutflow ? "-" : "+"}Rs {tx.amount.toLocaleString()}
+                                    </td>
+                                    <td className="py-2.5 px-3 text-center">
+                                      <button onClick={() => handleDeleteTransaction(tx.id)} className="text-[#8E8A80] hover:text-[#DC2626] p-1">
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                      </button>
+                                    </td>
+                                  </tr>
+                                );
+                              })}
+                            </tbody>
+                          </table>
+                        </div>
+                      )}
+                    </div>
+                  </>
+                );
+              })()}
+            </div>
+          )}
+
         </div>
       </main>
 
@@ -1877,6 +2209,7 @@ export default function Dashboard() {
               {modalFormType === "personal" && "Add Personal Wishlist Entry"}
               {modalFormType === "bank" && "Add Bank Transaction"}
               {modalFormType === "cashflow" && "Add Cash Flow Entry"}
+              {modalFormType === "business" && `Add Entry — ${businesses.find((b) => b.id === activeBusinessId)?.name || ""}`}
             </h3>
 
             <form onSubmit={handleFormSubmit} className="space-y-3 text-xs">
@@ -1891,7 +2224,8 @@ export default function Dashboard() {
                     modalFormType === "debt" ? "e.g. Loan from Mom or Lent to Friend" :
                     modalFormType === "subscription" ? "e.g. ChatGPT, Spotify, Gym" :
                     modalFormType === "gear" ? "e.g. 360 Drone, 200mm Lens" :
-                    modalFormType === "personal" ? "e.g. Sneakers, Headphones, Watch" : "e.g. Pocket Money, Rent, Deposit"
+                    modalFormType === "personal" ? "e.g. Sneakers, Headphones, Watch" :
+                    modalFormType === "business" ? "e.g. Client payment, Camera rental, Owner draw" : "e.g. Pocket Money, Rent, Deposit"
                   }
                   className="w-full px-3 py-2 bg-white border border-[#D6D2C8] rounded-xl text-[#1C1B17] focus:outline-none focus:border-[#18181B]"
                 />
@@ -1947,8 +2281,68 @@ export default function Dashboard() {
                   >
                     <option value="expense">Living Expense (Spent Money)</option>
                     <option value="income">Pocket Money / Income (+Cash On Hand)</option>
-                    <option value="transfer">Deposit to Bank (Cash On Hand → Sampath Bank)</option>
+                    <option value="transfer_deposit">Deposit to Bank (Cash On Hand → Sampath Bank)</option>
+                    <option value="transfer_withdraw">Withdraw to Cash (Sampath Bank → Cash On Hand)</option>
                   </select>
+                </div>
+              )}
+
+              {modalFormType === "cashflow" && fieldType !== "transfer_deposit" && fieldType !== "transfer_withdraw" && (
+                <div>
+                  <label className="block text-[#6B6860] mb-1 font-medium">
+                    {fieldType === "expense" ? "Paid From" : "Received Into"}
+                  </label>
+                  <select
+                    value={fieldAccountId}
+                    onChange={(e) => setFieldAccountId(e.target.value)}
+                    className="w-full px-3 py-2 bg-white border border-[#D6D2C8] rounded-xl text-[#1C1B17] focus:outline-none focus:border-[#18181B]"
+                  >
+                    <option value="">Auto (cash if it covers it, else bank)</option>
+                    {cashAccount && <option value={cashAccount.id}>Cash On Hand (Rs {cashAccount.balance.toLocaleString()})</option>}
+                    {bankAccount && <option value={bankAccount.id}>Sampath Bank (Rs {bankAccount.balance.toLocaleString()})</option>}
+                  </select>
+                  <p className="text-[10.5px] text-[#8E8A80] mt-1">
+                    Pick this explicitly for a cash {fieldType === "expense" ? "expense" : "income"} so it doesn't guess — "Auto" falls back to Sampath Bank whenever tracked cash can't cover the full amount.
+                  </p>
+                </div>
+              )}
+
+              {modalFormType === "business" && (
+                <div>
+                  <label className="block text-[#6B6860] mb-1 font-medium">Entry Type</label>
+                  <select
+                    value={fieldType}
+                    onChange={(e) => setFieldType(e.target.value)}
+                    className="w-full px-3 py-2 bg-white border border-[#D6D2C8] rounded-xl text-[#1C1B17] focus:outline-none focus:border-[#18181B]"
+                  >
+                    <option value="expense">Business Expense (Spent Money)</option>
+                    <option value="income">Business Income (+{businesses.find((b) => b.id === activeBusinessId)?.name})</option>
+                    <option value="draw">Owner's Draw (Business → Personal)</option>
+                    <option value="inject">Capital Injection (Personal → Business)</option>
+                  </select>
+                </div>
+              )}
+
+              {modalFormType === "business" && (fieldType === "draw" || fieldType === "inject") && (
+                <div>
+                  <label className="block text-[#6B6860] mb-1 font-medium">
+                    {fieldType === "draw" ? "Send To (Personal Account)" : "Take From (Personal Account)"}
+                  </label>
+                  <select
+                    value={fieldAccountId}
+                    onChange={(e) => setFieldAccountId(e.target.value)}
+                    required
+                    className="w-full px-3 py-2 bg-white border border-[#D6D2C8] rounded-xl text-[#1C1B17] focus:outline-none focus:border-[#18181B]"
+                  >
+                    <option value="">Select an account…</option>
+                    {cashAccount && <option value={cashAccount.id}>Cash On Hand (Rs {cashAccount.balance.toLocaleString()})</option>}
+                    {bankAccount && <option value={bankAccount.id}>Sampath Bank (Rs {bankAccount.balance.toLocaleString()})</option>}
+                  </select>
+                  <p className="text-[10.5px] text-[#8E8A80] mt-1">
+                    {fieldType === "draw"
+                      ? "Money leaves this business and lands in the personal account you pick."
+                      : "Money leaves the personal account you pick and funds this business."}
+                  </p>
                 </div>
               )}
 
@@ -1986,6 +2380,177 @@ export default function Dashboard() {
                 Save {modalFormType.toUpperCase()} Entry
               </button>
             </form>
+          </div>
+        </div>
+      )}
+
+      {/* ACCOUNT-PICKER MODAL — shared by pay subscription / settle debt / partial debt
+          payment / update gear savings, replacing the plain prompt()s and one-click
+          buttons those used to be. All four used to move money by guessing an account
+          the same way the old Add Entry form did. */}
+      {accountModal && (
+        <div
+          className="fixed inset-0 z-50 bg-black/40 backdrop-blur-xs flex items-center justify-center p-4"
+          onClick={(e) => { if (e.target === e.currentTarget) setAccountModal(null); }}
+        >
+          <div className="bg-[#EFECE5] w-full max-w-md rounded-2xl border border-[#D6D2C8] p-6 space-y-4 shadow-xl relative">
+            <button onClick={() => setAccountModal(null)} className="absolute top-4 right-4 text-[#74716A] hover:text-[#1C1B17]">
+              <X className="w-5 h-5" />
+            </button>
+
+            <h3 className="text-base font-bold text-[#1C1B17]">
+              {accountModal.type === "sub-pay" && `Pay ${accountModal.sub.name}`}
+              {accountModal.type === "debt-settle" && `Settle Debt — ${accountModal.debt.person}`}
+              {accountModal.type === "debt-pay" && (accountModal.debt.type === "i_owe" ? `Record Repayment — ${accountModal.debt.person}` : `Record Collection — ${accountModal.debt.person}`)}
+              {accountModal.type === "gear-savings" && `Update Savings — ${accountModal.gear.title}`}
+            </h3>
+
+            <form onSubmit={handleAccountModalSubmit} className="space-y-3 text-xs">
+              {accountModal.type === "sub-pay" && (
+                <p className="text-[#6B6860]">Amount: <span className="font-mono font-bold text-[#1C1B17]">Rs {accountModal.sub.cost.toLocaleString()}</span></p>
+              )}
+
+              {accountModal.type === "debt-settle" && (
+                <p className="text-[#6B6860]">
+                  Remaining balance:{" "}
+                  <span className="font-mono font-bold text-[#1C1B17]">
+                    Rs {(accountModal.debt.remaining_amount ?? (accountModal.debt.amount - accountModal.debt.paid_amount)).toLocaleString()}
+                  </span>
+                </p>
+              )}
+
+              {(accountModal.type === "debt-pay" || accountModal.type === "gear-savings") && (
+                <div>
+                  <label className="block text-[#6B6860] mb-1 font-medium">
+                    {accountModal.type === "debt-pay"
+                      ? (accountModal.debt.type === "i_owe" ? "Repayment Amount (Rs)" : "Collection Amount (Rs)")
+                      : "New Total Saved (Rs)"}
+                  </label>
+                  <input
+                    type="number"
+                    required
+                    autoFocus
+                    value={actionAmount}
+                    onChange={(e) => setActionAmount(e.target.value)}
+                    placeholder={
+                      accountModal.type === "debt-pay"
+                        ? `Remaining: Rs ${(accountModal.debt.remaining_amount ?? (accountModal.debt.amount - accountModal.debt.paid_amount)).toLocaleString()}`
+                        : `Cost: Rs ${accountModal.gear.cost.toLocaleString()}`
+                    }
+                    className="w-full px-3 py-2 bg-white border border-[#D6D2C8] rounded-xl text-[#1C1B17] focus:outline-none focus:border-[#18181B]"
+                  />
+                </div>
+              )}
+
+              <div>
+                <label className="block text-[#6B6860] mb-1 font-medium">
+                  {accountModal.type === "debt-pay" && accountModal.debt.type === "lent" ? "Received Into" : "Paid From"}
+                </label>
+                <select
+                  value={actionAccountId}
+                  onChange={(e) => setActionAccountId(e.target.value)}
+                  className="w-full px-3 py-2 bg-white border border-[#D6D2C8] rounded-xl text-[#1C1B17] focus:outline-none focus:border-[#18181B]"
+                >
+                  <option value="">Auto (cash if it covers it, else bank)</option>
+                  {cashAccount && <option value={cashAccount.id}>Cash On Hand (Rs {cashAccount.balance.toLocaleString()})</option>}
+                  {bankAccount && <option value={bankAccount.id}>Sampath Bank (Rs {bankAccount.balance.toLocaleString()})</option>}
+                </select>
+                <p className="text-[10.5px] text-[#8E8A80] mt-1">
+                  Pick this explicitly so it doesn't guess — "Auto" falls back to Sampath Bank whenever tracked cash can't cover the full amount.
+                </p>
+              </div>
+
+              <button
+                type="submit"
+                className="w-full py-2 bg-[#18181B] hover:bg-[#27272A] text-white rounded-xl font-bold text-xs mt-2 transition"
+              >
+                {accountModal.type === "sub-pay" && "Mark Paid"}
+                {accountModal.type === "debt-settle" && "Settle in Full"}
+                {accountModal.type === "debt-pay" && "Save Payment"}
+                {accountModal.type === "gear-savings" && "Update Savings"}
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* PROMPT MODAL — replaces window.prompt() (Add/Rename Business, Edit Bank/Cash Balance) */}
+      {promptModal && (
+        <div
+          className="fixed inset-0 z-50 bg-black/40 backdrop-blur-xs flex items-center justify-center p-4"
+          onClick={(e) => { if (e.target === e.currentTarget) setPromptModal(null); }}
+        >
+          <div className="bg-[#EFECE5] w-full max-w-md rounded-2xl border border-[#D6D2C8] p-6 space-y-4 shadow-xl relative">
+            <button onClick={() => setPromptModal(null)} className="absolute top-4 right-4 text-[#74716A] hover:text-[#1C1B17]">
+              <X className="w-5 h-5" />
+            </button>
+
+            <h3 className="text-base font-bold text-[#1C1B17]">{promptModal.title}</h3>
+
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                const { onSubmit } = promptModal;
+                setPromptModal(null);
+                onSubmit(promptValue);
+              }}
+              className="space-y-3 text-xs"
+            >
+              <div>
+                <label className="block text-[#6B6860] mb-1 font-medium">{promptModal.label}</label>
+                <input
+                  type={promptModal.isNumber ? "number" : "text"}
+                  required
+                  autoFocus
+                  value={promptValue}
+                  onChange={(e) => setPromptValue(e.target.value)}
+                  placeholder={promptModal.placeholder}
+                  className="w-full px-3 py-2 bg-white border border-[#D6D2C8] rounded-xl text-[#1C1B17] focus:outline-none focus:border-[#18181B]"
+                />
+              </div>
+
+              <button
+                type="submit"
+                className="w-full py-2 bg-[#18181B] hover:bg-[#27272A] text-white rounded-xl font-bold text-xs mt-2 transition"
+              >
+                Save
+              </button>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {/* CONFIRM MODAL — replaces window.confirm() (delete entry confirmations) */}
+      {confirmModal && (
+        <div
+          className="fixed inset-0 z-50 bg-black/40 backdrop-blur-xs flex items-center justify-center p-4"
+          onClick={(e) => { if (e.target === e.currentTarget) setConfirmModal(null); }}
+        >
+          <div className="bg-[#EFECE5] w-full max-w-sm rounded-2xl border border-[#D6D2C8] p-6 space-y-4 shadow-xl relative">
+            <button onClick={() => setConfirmModal(null)} className="absolute top-4 right-4 text-[#74716A] hover:text-[#1C1B17]">
+              <X className="w-5 h-5" />
+            </button>
+
+            <h3 className="text-sm font-semibold text-[#1C1B17] pr-6">{confirmModal.message}</h3>
+
+            <div className="flex space-x-2">
+              <button
+                onClick={() => setConfirmModal(null)}
+                className="flex-1 py-2 bg-white border border-[#D6D2C8] hover:bg-[#F6F4EE] text-[#1C1B17] rounded-xl font-bold text-xs transition"
+              >
+                Cancel
+              </button>
+              <button
+                onClick={() => {
+                  const { onConfirm } = confirmModal;
+                  setConfirmModal(null);
+                  onConfirm();
+                }}
+                className="flex-1 py-2 bg-[#DC2626] hover:bg-[#B91C1C] text-white rounded-xl font-bold text-xs transition"
+              >
+                Delete
+              </button>
+            </div>
           </div>
         </div>
       )}

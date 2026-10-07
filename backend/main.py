@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from typing import List, Dict, Any
 from datetime import datetime, timedelta
 import json
+import os
 
 import models
 import schemas
@@ -125,6 +126,9 @@ def migrate_schema(db: Session):
     if "is_archived" not in existing_cols:
         db.execute(text("ALTER TABLE transactions ADD COLUMN is_archived BOOLEAN DEFAULT 0"))
         db.commit()
+    if "to_account_id" not in existing_cols:
+        db.execute(text("ALTER TABLE transactions ADD COLUMN to_account_id INTEGER"))
+        db.commit()
 
     # "kind" distinguishes Business Equipment Kit items from the newer Personal Wishlist.
     # DEFAULT 'business' backfills every existing row, so gear entered before this column
@@ -132,6 +136,14 @@ def migrate_schema(db: Session):
     gear_cols = {row[1] for row in db.execute(text("PRAGMA table_info(gear_items)")).fetchall()}
     if "kind" not in gear_cols:
         db.execute(text("ALTER TABLE gear_items ADD COLUMN kind TEXT DEFAULT 'business'"))
+        db.commit()
+
+    # business_id on accounts: added for the Businesses feature. The businesses table
+    # itself is brand new, so Base.metadata.create_all already creates it — only this
+    # column on the pre-existing accounts table needs a manual migration.
+    account_cols = {row[1] for row in db.execute(text("PRAGMA table_info(accounts)")).fetchall()}
+    if "business_id" not in account_cols:
+        db.execute(text("ALTER TABLE accounts ADD COLUMN business_id INTEGER"))
         db.commit()
 
     # One-time conversion of every money column from "rupees stored as float" to
@@ -377,12 +389,24 @@ def create_transaction(tx: schemas.TransactionCreate, db: Session = Depends(get_
             target.balance -= tx.amount
             db_tx.account_id = target.id
     elif tx.transaction_type == "transfer":
-        # Deposit cash into bank (Transfer: -Cash, +Bank, 0 expense!). Both accounts are
-        # always touched deterministically, so no single account_id is needed here.
-        if cash_acc:
-            cash_acc.balance -= tx.amount
-        if bank_acc:
-            bank_acc.balance += tx.amount
+        # Generalized: any account -> any account (used to be hardcoded Cash On Hand ->
+        # Sampath Bank only, which meant no withdrawal direction existed at all, and no
+        # way to move money into or out of a business account). Both ends are now
+        # required explicitly — there's no sensible default to guess for "which two
+        # accounts" the way there is for income/expense.
+        from_acc = explicit_acc
+        to_acc = (
+            db.query(models.Account).filter(models.Account.id == tx.to_account_id).first()
+            if tx.to_account_id is not None else None
+        )
+        if not from_acc or not to_acc:
+            raise HTTPException(status_code=400, detail="A transfer needs both a source (account_id) and a destination (to_account_id) account.")
+        if from_acc.id == to_acc.id:
+            raise HTTPException(status_code=400, detail="Transfer source and destination must be different accounts.")
+        from_acc.balance -= tx.amount
+        to_acc.balance += tx.amount
+        db_tx.account_id = from_acc.id
+        db_tx.to_account_id = to_acc.id
 
     db.add(db_tx)
     db.commit()
@@ -399,10 +423,21 @@ def delete_transaction(tx_id: int, db: Session = Depends(get_db)):
     cash_acc = get_account(db, "Cash On Hand")
 
     if tx.transaction_type == "transfer":
-        if cash_acc:
-            cash_acc.balance += tx.amount
-        if bank_acc:
-            bank_acc.balance -= tx.amount
+        # Reverse the exact pair this transfer moved between. Falls back to the old
+        # hardcoded Cash -> Bank pair only for legacy rows from before transfers
+        # recorded their own accounts (account_id/to_account_id both null then).
+        if tx.account_id is not None and tx.to_account_id is not None:
+            from_acc = db.query(models.Account).filter(models.Account.id == tx.account_id).first()
+            to_acc = db.query(models.Account).filter(models.Account.id == tx.to_account_id).first()
+            if from_acc:
+                from_acc.balance += tx.amount
+            if to_acc:
+                to_acc.balance -= tx.amount
+        else:
+            if cash_acc:
+                cash_acc.balance += tx.amount
+            if bank_acc:
+                bank_acc.balance -= tx.amount
     else:
         # Reverse the exact account this transaction hit at creation time, not whichever
         # account happens to look right now. Falls back to the old cash-first guess only
@@ -448,23 +483,30 @@ def get_archived_month_transactions(month: str, db: Session = Depends(get_db)):
         models.Transaction.date.like(f"{month}%")
     ).order_by(models.Transaction.date.desc()).all()
 
-def _move_money_for_debt_payment(db: Session, debt: models.DebtItem, payment: float):
+def _move_money_for_debt_payment(db: Session, debt: models.DebtItem, payment: float, account_id: int = None):
     """Move real money for a debt payment and log a transaction for it.
     Direction depends on which side of the debt this is: paying down what I owe
     ('i_owe', e.g. Mom's loan) is money leaving my accounts; collecting a
     receivable ('lent', e.g. Pasindu paying me back) is money coming in. This
-    mirrors the 'repayment' vs 'collection' language the frontend already uses."""
+    mirrors the 'repayment' vs 'collection' language the frontend already uses.
+
+    account_id is the caller's explicit choice, when given — the frontend's account
+    picker. Without one, this falls back to the old heuristic (cash if it covers the
+    amount else bank for a repayment; cash first for a collection), which is exactly
+    what used to silently redirect payments to bank whenever tracked cash looked too
+    low, with no way to override it."""
     if payment <= 0:
         return
 
     bank_acc = get_account(db, "Sampath Bank")
     cash_acc = get_account(db, "Cash On Hand")
+    explicit_acc = db.query(models.Account).filter(models.Account.id == account_id).first() if account_id is not None else None
 
     if debt.type == "i_owe":
-        target = cash_acc if (cash_acc and cash_acc.balance >= payment) else bank_acc
+        target = explicit_acc or (cash_acc if (cash_acc and cash_acc.balance >= payment) else bank_acc)
         tx_type, sign, desc = "expense", -1, f"Debt repayment to {debt.person}"
     else:
-        target = cash_acc or bank_acc
+        target = explicit_acc or cash_acc or bank_acc
         tx_type, sign, desc = "income", 1, f"Debt collected from {debt.person}"
 
     if target:
@@ -503,7 +545,7 @@ def create_debt(debt: schemas.DebtItemCreate, db: Session = Depends(get_db)):
     return resp
 
 @app.patch("/api/v1/debts/{debt_id}/settle", response_model=schemas.DebtItemResponse)
-def settle_debt(debt_id: int, db: Session = Depends(get_db)):
+def settle_debt(debt_id: int, payload: schemas.DebtSettleUpdate = schemas.DebtSettleUpdate(), db: Session = Depends(get_db)):
     debt = db.query(models.DebtItem).filter(models.DebtItem.id == debt_id).first()
     if not debt:
         raise HTTPException(status_code=404, detail="Debt item not found")
@@ -511,7 +553,7 @@ def settle_debt(debt_id: int, db: Session = Depends(get_db)):
     remaining = max(0.0, debt.amount - debt.paid_amount)
     debt.paid_amount = debt.amount
     debt.is_settled = True
-    _move_money_for_debt_payment(db, debt, remaining)
+    _move_money_for_debt_payment(db, debt, remaining, account_id=payload.account_id)
 
     db.commit()
     db.refresh(debt)
@@ -531,7 +573,7 @@ def pay_debt(debt_id: int, payload: schemas.DebtPaymentUpdate, db: Session = Dep
         debt.paid_amount = debt.paid_amount + payment
         if debt.paid_amount >= debt.amount:
             debt.is_settled = True
-        _move_money_for_debt_payment(db, debt, payment)
+        _move_money_for_debt_payment(db, debt, payment, account_id=payload.account_id)
         db.commit()
         db.refresh(debt)
 
@@ -562,7 +604,7 @@ def create_subscription(sub: schemas.SubscriptionCreate, db: Session = Depends(g
     return db_sub
 
 @app.patch("/api/v1/subscriptions/{sub_id}/pay", response_model=schemas.SubscriptionResponse)
-def pay_subscription(sub_id: int, db: Session = Depends(get_db)):
+def pay_subscription(sub_id: int, payload: schemas.SubscriptionPaymentUpdate = schemas.SubscriptionPaymentUpdate(), db: Session = Depends(get_db)):
     sub = db.query(models.Subscription).filter(models.Subscription.id == sub_id).first()
     if not sub:
         raise HTTPException(status_code=404, detail="Subscription not found")
@@ -571,6 +613,15 @@ def pay_subscription(sub_id: int, db: Session = Depends(get_db)):
     sub.last_paid_date = datetime.now().strftime("%Y-%m-%d")
 
     bank_acc = get_account(db, "Sampath Bank")
+    # Previously this unconditionally hit bank with no way to say otherwise — there
+    # was no way to record a subscription paid in cash at all. Default stays bank
+    # (unchanged behavior for anyone who doesn't pick), but an explicit account_id
+    # now overrides it.
+    explicit_acc = (
+        db.query(models.Account).filter(models.Account.id == payload.account_id).first()
+        if payload.account_id is not None else None
+    )
+    target = explicit_acc or bank_acc
 
     tx = models.Transaction(
         date=sub.last_paid_date,
@@ -581,12 +632,12 @@ def pay_subscription(sub_id: int, db: Session = Depends(get_db)):
         is_fixed=True,
         # Record which account this actually hit so a later delete reverses the
         # same account instead of falling back to the cash-first legacy guess.
-        account_id=bank_acc.id if bank_acc else None,
+        account_id=target.id if target else None,
     )
     db.add(tx)
 
-    if bank_acc:
-        bank_acc.balance -= sub.cost
+    if target:
+        target.balance -= sub.cost
 
     db.commit()
     db.refresh(sub)
@@ -600,6 +651,61 @@ def delete_subscription(sub_id: int, db: Session = Depends(get_db)):
     db.delete(sub)
     db.commit()
     return {"message": "Subscription deleted successfully"}
+
+# Accounts API — lets the frontend offer an explicit "which account" picker
+# instead of relying on the create_transaction/gear-savings heuristics (cash if it
+# covers the amount, else bank) to guess. The schema already existed; no endpoint
+# had ever used it.
+@app.get("/api/v1/accounts", response_model=List[schemas.AccountResponse])
+def get_accounts(db: Session = Depends(get_db)):
+    return db.query(models.Account).all()
+
+# Businesses API — each business gets exactly one Account (type="business"), created
+# alongside it and kept name-synced on rename. Which business a transaction belongs
+# to is derived entirely from account_id/to_account_id, never stored redundantly.
+@app.get("/api/v1/businesses", response_model=List[schemas.BusinessResponse])
+def get_businesses(db: Session = Depends(get_db)):
+    businesses = db.query(models.Business).order_by(models.Business.name.asc()).all()
+    results = []
+    for b in businesses:
+        acc = db.query(models.Account).filter(models.Account.business_id == b.id).first()
+        results.append(schemas.BusinessResponse(
+            id=b.id, name=b.name, created_at=b.created_at,
+            account_id=acc.id if acc else 0,
+            balance=acc.balance if acc else 0.0,
+        ))
+    return results
+
+@app.post("/api/v1/businesses", response_model=schemas.BusinessResponse)
+def create_business(payload: schemas.BusinessCreate, db: Session = Depends(get_db)):
+    business = models.Business(name=payload.name)
+    db.add(business)
+    db.flush()  # assigns business.id without ending the transaction
+
+    account = models.Account(name=payload.name, type="business", balance=0.0, currency="Rs", business_id=business.id)
+    db.add(account)
+    db.commit()
+    db.refresh(business)
+    db.refresh(account)
+    return schemas.BusinessResponse(id=business.id, name=business.name, created_at=business.created_at, account_id=account.id, balance=account.balance)
+
+@app.patch("/api/v1/businesses/{business_id}", response_model=schemas.BusinessResponse)
+def rename_business(business_id: int, payload: schemas.BusinessRename, db: Session = Depends(get_db)):
+    business = db.query(models.Business).filter(models.Business.id == business_id).first()
+    if not business:
+        raise HTTPException(status_code=404, detail="Business not found")
+    account = db.query(models.Account).filter(models.Account.business_id == business.id).first()
+
+    business.name = payload.name
+    if account:
+        account.name = payload.name  # keep the account's own name in sync
+    db.commit()
+    db.refresh(business)
+    return schemas.BusinessResponse(
+        id=business.id, name=business.name, created_at=business.created_at,
+        account_id=account.id if account else 0,
+        balance=account.balance if account else 0.0,
+    )
 
 # Bank Statements & Account Balance API
 @app.get("/api/v1/bank-statements", response_model=List[schemas.BankStatementResponse])
@@ -700,12 +806,16 @@ def update_gear_savings(gear_id: int, update_data: schemas.GearSavingsUpdate, db
     if delta != 0:
         bank_acc = get_account(db, "Sampath Bank")
         cash_acc = get_account(db, "Cash On Hand")
+        explicit_acc = (
+            db.query(models.Account).filter(models.Account.id == update_data.account_id).first()
+            if update_data.account_id is not None else None
+        )
 
         if delta > 0:
-            target = cash_acc if (cash_acc and cash_acc.balance >= delta) else bank_acc
+            target = explicit_acc or (cash_acc if (cash_acc and cash_acc.balance >= delta) else bank_acc)
             tx_type, desc = "expense", f"Savings contribution: {gear.title}"
         else:
-            target = cash_acc or bank_acc
+            target = explicit_acc or cash_acc or bank_acc
             tx_type, desc = "income", f"Savings withdrawal: {gear.title}"
 
         if target:
@@ -788,8 +898,12 @@ def export_json_payload(db: Session = Depends(get_db)):
         "equipment_kit": gears,
     }
 
-    # Write to local file for Antigravity CLI / agent ingestion
-    filepath = "/Users/tevinbandara/Desktop/Finance Tracker/finance_audit_export.json"
+    # Write to local file for Antigravity CLI / agent ingestion. Derived from this
+    # file's own location (not hardcoded) so it stays correct if the project folder
+    # is ever moved again — a hardcoded absolute path here is exactly what broke
+    # when the project moved from Desktop to Documents/Projects.
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    filepath = os.path.join(project_root, "finance_audit_export.json")
     with open(filepath, "w") as f:
         json.dump(export_data, f, indent=2, default=str)
 

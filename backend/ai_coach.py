@@ -5,9 +5,16 @@ from typing import Optional
 
 from constants import RENT_AMOUNT
 
+# AGY_PATH lives under the user's home directory, not the project folder, so it's
+# unaffected by where the project itself is moved. WORKSPACE_DIR/LOG_FILE, by
+# contrast, previously hardcoded the project's absolute path — that broke the
+# instant the folder was moved (Desktop -> Documents/Projects). Deriving them from
+# this file's own location instead means they're correct no matter where the
+# project lives, including after a future move.
 AGY_PATH = "/Users/tevinbandara/.local/bin/agy"
-WORKSPACE_DIR = "/Users/tevinbandara/Desktop/Finance Tracker"
-LOG_FILE = "/Users/tevinbandara/Desktop/Finance Tracker/backend/agy_coach.log"
+BACKEND_DIR = os.path.dirname(os.path.abspath(__file__))
+WORKSPACE_DIR = os.path.dirname(BACKEND_DIR)
+LOG_FILE = os.path.join(BACKEND_DIR, "agy_coach.log")
 
 def call_antigravity_cli(prompt: str) -> Optional[str]:
     """

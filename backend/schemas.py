@@ -12,6 +12,7 @@ class AccountBase(BaseModel):
     type: str
     balance: float
     currency: str = "Rs"
+    business_id: Optional[int] = None
 
 class AccountResponse(AccountBase):
     id: int
@@ -28,9 +29,16 @@ class TransactionBase(BaseModel):
     category: str
     transaction_type: str  # 'income', 'expense', 'transfer'
     is_fixed: bool = False
-    # Optional: caller may pick the account explicitly (e.g. a future account picker in the UI).
-    # If omitted, the backend resolves and records one automatically.
+    # Optional: caller may pick the account explicitly. If omitted, the backend
+    # resolves and records one automatically (income/expense only — see
+    # create_transaction; a transfer always requires both explicitly).
     account_id: Optional[int] = None
+    # Transfer destination — required for transaction_type="transfer", meaningless
+    # otherwise. This is what generalized Transfer from a hardcoded Cash->Bank-only
+    # move into a real "any account -> any account" one (Owner's Draw, Capital
+    # Injection, and finally being able to withdraw cash from the bank, not just
+    # deposit into it).
+    to_account_id: Optional[int] = None
     is_archived: bool = False
 
 class TransactionCreate(TransactionBase):
@@ -69,6 +77,14 @@ class DebtItemResponse(DebtItemBase):
 
 class DebtPaymentUpdate(BaseModel):
     payment_amount: float = Field(gt=0)
+    # Optional explicit choice of which account this payment/collection hits. If
+    # omitted, falls back to the old heuristic (cash if it covers the amount, else
+    # bank for a repayment; cash first for a collection) — same account_id pattern
+    # already used by TransactionCreate.
+    account_id: Optional[int] = None
+
+class DebtSettleUpdate(BaseModel):
+    account_id: Optional[int] = None
 
 class SubscriptionBase(BaseModel):
     name: str
@@ -125,6 +141,10 @@ class GearItemResponse(GearItemBase):
 class GearSavingsUpdate(BaseModel):
     saved_amount: float = Field(ge=0)
     is_paid: Optional[bool] = None
+    account_id: Optional[int] = None
+
+class SubscriptionPaymentUpdate(BaseModel):
+    account_id: Optional[int] = None
 
 class SummaryResponse(BaseModel):
     bank_balance: float
@@ -170,3 +190,16 @@ class ArchivedMonthSummary(BaseModel):
     expense: float
     net: float
     transaction_count: int
+
+class BusinessCreate(BaseModel):
+    name: str = Field(min_length=1)
+
+class BusinessRename(BaseModel):
+    name: str = Field(min_length=1)
+
+class BusinessResponse(BaseModel):
+    id: int
+    name: str
+    account_id: int
+    balance: float
+    created_at: Optional[datetime] = None
