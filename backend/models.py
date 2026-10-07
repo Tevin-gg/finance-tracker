@@ -23,14 +23,30 @@ class Money(TypeDecorator):
             return None
         return value / 100.0
 
+class Business(Base):
+    """One of your businesses. Each gets exactly one Account (see Account.business_id
+    below) — its own balance, completely separate from personal accounts and from
+    every other business. Which business a transaction belongs to is never stored on
+    the transaction itself — it's entirely derived from which account the transaction
+    hit, same account-centric approach the rest of the app already uses."""
+    __tablename__ = "businesses"
+
+    id = Column(Integer, primary_key=True, index=True)
+    name = Column(String, unique=True, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 class Account(Base):
     __tablename__ = "accounts"
 
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String, unique=True, index=True)
-    type = Column(String)  # 'bank', 'debt', 'cash'
+    type = Column(String)  # 'bank', 'debt', 'cash', 'business'
     balance = Column(Money, default=0.0)
     currency = Column(String, default="Rs")
+    # Set only on a business's own account (type='business'). Null for every personal
+    # account (Sampath Bank, Cash On Hand, Subscription Account) and the legacy debt/
+    # trading rows.
+    business_id = Column(Integer, ForeignKey("businesses.id"), nullable=True)
 
 class Transaction(Base):
     __tablename__ = "transactions"
@@ -42,12 +58,18 @@ class Transaction(Base):
     category = Column(String)
     transaction_type = Column(String)  # 'income', 'expense', 'transfer'
     is_fixed = Column(Boolean, default=False)
-    # Which single account this income/expense actually hit. Recorded at creation time
-    # so a later delete reverses the SAME account instead of re-guessing (which used to
-    # cause cash/bank balance drift when the guess at delete time didn't match create time).
-    # Null on rows created before this column existed, or on transfers (which always
-    # touch both cash and bank deterministically and don't need it).
+    # For income/expense: the single account it hit. For a transfer: the SOURCE
+    # account (paired with to_account_id below as the destination) — this is what
+    # makes a transfer a real "any account -> any account" move (personal cash/bank
+    # in either direction, Owner's Draw out of a business, Capital Injection into
+    # one) instead of the old hardcoded Cash On Hand -> Sampath Bank only direction.
+    # Recorded at creation time so a later delete reverses the SAME account(s)
+    # instead of re-guessing. Null on legacy rows created before this column existed
+    # (pre-generalization transfers all really were Cash -> Bank, so delete_transaction
+    # falls back to that exact pair for those).
     account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
+    # Transfer destination account. Unused (null) for income/expense rows.
+    to_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
     # Set True by the monthly close-out (see main.maybe_close_month): the transaction
     # belongs to a prior, already-closed month. Archived rows are never deleted and
     # never touched again — they stay out of the "current" Cash Flow Ledger and
