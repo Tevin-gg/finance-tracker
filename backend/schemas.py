@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator, model_validator
 from typing import Optional, List, Literal
 from datetime import datetime
 
@@ -31,12 +31,21 @@ class TransactionBase(BaseModel):
     # Optional: caller may pick the account explicitly (e.g. a future account picker in the UI).
     # If omitted, the backend resolves and records one automatically.
     account_id: Optional[int] = None
+    from_account_id: Optional[int] = None
+    to_account_id: Optional[int] = None
     is_archived: bool = False
 
 class TransactionCreate(TransactionBase):
     date: str = Field(pattern=ISO_DATE_PATTERN)
-    amount: float = Field(gt=0)
+    amount: float = Field(gt=0, allow_inf_nan=False)
     transaction_type: Literal["income", "expense", "transfer"]
+
+    @field_validator("date")
+    @classmethod
+    def valid_calendar_date(cls, value: str) -> str:
+        # A regex alone accepts impossible dates such as 2026-02-30.
+        datetime.strptime(value, "%Y-%m-%d")
+        return value
 
 class TransactionResponse(TransactionBase):
     id: int
@@ -77,6 +86,7 @@ class SubscriptionBase(BaseModel):
     category: str = "Software & Services"
     is_paid_this_month: bool = False
     last_paid_date: Optional[str] = None
+    payment_transaction_id: Optional[int] = None
 
 class SubscriptionCreate(SubscriptionBase):
     cost: float = Field(gt=0)
@@ -95,8 +105,20 @@ class BankStatementBase(BaseModel):
 
 class BankStatementCreate(BankStatementBase):
     date: str = Field(pattern=ISO_DATE_PATTERN)
-    deposit: float = Field(default=0.0, ge=0)
-    withdrawal: float = Field(default=0.0, ge=0)
+    deposit: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+    withdrawal: float = Field(default=0.0, ge=0, allow_inf_nan=False)
+
+    @field_validator("date")
+    @classmethod
+    def valid_calendar_date(cls, value: str) -> str:
+        datetime.strptime(value, "%Y-%m-%d")
+        return value
+
+    @model_validator(mode="after")
+    def one_bank_movement(self):
+        if (self.deposit > 0) == (self.withdrawal > 0):
+            raise ValueError("Enter either a positive deposit or a positive withdrawal, not both.")
+        return self
 
 class BankStatementResponse(BankStatementBase):
     id: int
@@ -162,7 +184,7 @@ class BalanceUpdate(BaseModel):
     # Dict[str, float] and silently defaulted a missing "balance" key to 0.0 — a
     # malformed request would zero out a real account balance without any error.
     # A required field here means that same request now gets a clean 422 instead.
-    balance: float
+    balance: float = Field(allow_inf_nan=False)
 
 class ArchivedMonthSummary(BaseModel):
     month: str  # "YYYY-MM"
