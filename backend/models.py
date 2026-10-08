@@ -48,6 +48,10 @@ class Transaction(Base):
     # Null on rows created before this column existed, or on transfers (which always
     # touch both cash and bank deterministically and don't need it).
     account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
+    # Source and destination are recorded for reversible account-to-account transfers.
+    # Older transfers leave these null and retain the Cash -> Sampath fallback.
+    from_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
+    to_account_id = Column(Integer, ForeignKey("accounts.id"), nullable=True)
     # Set True by the monthly close-out (see main.maybe_close_month): the transaction
     # belongs to a prior, already-closed month. Archived rows are never deleted and
     # never touched again — they stay out of the "current" Cash Flow Ledger and
@@ -80,6 +84,7 @@ class Subscription(Base):
     category = Column(String, default="Software & Services")
     is_paid_this_month = Column(Boolean, default=False)
     last_paid_date = Column(String, nullable=True)
+    payment_transaction_id = Column(Integer, ForeignKey("transactions.id"), nullable=True)
 
 class BankStatementItem(Base):
     __tablename__ = "bank_statements"
